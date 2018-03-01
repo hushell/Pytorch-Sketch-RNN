@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
 
 import symm_lstm
 
@@ -20,6 +21,9 @@ parser = argparse.ArgumentParser(description='sketch RNN')
 parser.add_argument('--gpu_id', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--symm', action='store_true')
+parser.add_argument('--save_img', action='store_true')
+parser.add_argument('--ckpt_dir', default='./', type=str,
+                    help='save parameters and logs in this folder')
 opt = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_id
@@ -84,15 +88,23 @@ def normalize(strokes):
     return data
 
 dataset = np.load(hp.data_location, encoding='latin1')
-data = dataset['train']
-data = purify(data)
-data = normalize(data)
-Nmax = max_size(data)
+# train set
+dataTrain = dataset['train']
+dataTrain = purify(dataTrain)
+dataTrain = normalize(dataTrain)
+Nmax = max_size(dataTrain)
+
+# test set
+dataTest = dataset['test']
+dataTest = purify(dataTest)
+dataTest = normalize(dataTest)
 
 ############################## function to generate a batch:
-def make_batch(batch_size, batch_idx=None):
+def make_batch(data, batch_size, batch_idx=None):
     if batch_idx is None:
         batch_idx = np.random.choice(len(data),batch_size)
+    assert(max(batch_idx) < len(data))
+
     batch_sequences = [data[idx] for idx in batch_idx]
     strokes = []
     lengths = []
@@ -151,14 +163,18 @@ class EncoderRNN(nn.Module):
                 hidden = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size))
                 cell = Variable(torch.zeros(2, batch_size, hp.enc_hidden_size))
             hidden_cell = (hidden, cell)
+
         _, (hidden,cell) = self.lstm(inputs.float(), hidden_cell)
+
         # hidden is (2, batch_size, hidden_size), we want (batch_size, 2*hidden_size):
         hidden_forward, hidden_backward = torch.split(hidden,1,0)
         hidden_cat = torch.cat([hidden_forward.squeeze(0), hidden_backward.squeeze(0)],1)
+
         # mu and sigma:
         mu = self.fc_mu(hidden_cat)
         sigma_hat = self.fc_sigma(hidden_cat)
         sigma = torch.exp(sigma_hat/2.)
+
         # N ~ N(0,1)
         z_size = mu.size()
         if use_cuda:
@@ -166,6 +182,7 @@ class EncoderRNN(nn.Module):
         else:
             N = Variable(torch.normal(torch.zeros(z_size),torch.ones(z_size)))
         z = mu + sigma*N
+
         # mu and sigma_hat are needed for LKL loss
         return z, mu, sigma_hat
 
@@ -192,6 +209,7 @@ class DecoderRNN(nn.Module):
             hidden_cell = (hidden.unsqueeze(0).contiguous(), cell.unsqueeze(0).contiguous())
 
         outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
+
         # in training we feed the lstm with the whole input in one shot
         # and use all outputs contained in 'outputs', while in generate
         # mode we just feed with the last generated sample:
@@ -220,6 +238,7 @@ class DecoderRNN(nn.Module):
         mu_x = mu_x.t().squeeze().contiguous().view(len_out,-1,hp.M)
         mu_y = mu_y.t().squeeze().contiguous().view(len_out,-1,hp.M)
         q = F.softmax(params_pen).view(len_out,-1,3)
+
         return pi,mu_x,mu_y,sigma_x,sigma_y,rho_xy,q,hidden,cell
 
 class Model():
@@ -241,7 +260,9 @@ class Model():
         else:
             eos = Variable(torch.stack([torch.Tensor([0,0,0,0,1])]\
                 *batch.size()[1])).unsqueeze(0)
+
         batch = torch.cat([batch, eos], 0)
+
         mask = torch.zeros(Nmax+1, batch.size()[1])
         for indice,length in enumerate(lengths):
             mask[:length,indice] = 1
@@ -249,12 +270,14 @@ class Model():
             mask = Variable(mask.cuda()).detach()
         else:
             mask = Variable(mask).detach()
+
         dx = torch.stack([Variable(batch.data[:,:,0])]*hp.M,2).detach()
         dy = torch.stack([Variable(batch.data[:,:,1])]*hp.M,2).detach()
         p1 = Variable(batch.data[:,:,2]).detach()
         p2 = Variable(batch.data[:,:,3]).detach()
         p3 = Variable(batch.data[:,:,4]).detach()
         p = torch.stack([p1,p2,p3],2)
+
         return mask,dx,dy,p
 
     def train(self, epoch):
@@ -262,9 +285,12 @@ class Model():
 
         self.encoder.train()
         self.decoder.train()
-        batch, lengths = make_batch(hp.batch_size)
+
+        batch, lengths = make_batch(dataTrain, hp.batch_size)
+
         # encode:
         z, self.mu, self.sigma = self.encoder(batch, hp.batch_size)
+
         # create start of sequence:
         if use_cuda:
             sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
@@ -272,26 +298,35 @@ class Model():
         else:
             sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
                 *hp.batch_size)).unsqueeze(0)
+
         # had sos at the begining of the batch:
         batch_init = torch.cat([sos, batch],0)
+
         # expend z to be ready to concatenate with inputs:
         z_stack = torch.stack([z]*(Nmax+1))
+
         # inputs is concatenation of z and batch_inputs
         inputs = torch.cat([batch_init, z_stack],2)
+
         # decode:
         self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
             self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
+
         # prepare targets:
         mask,dx,dy,p = self.make_target(batch, lengths)
+
         # prepare optimizers:
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
+
         # update eta for LKL:
         self.eta_step = 1-(1-hp.eta_min)*hp.R
+
         # compute losses:
         LKL = self.kullback_leibler_loss()
-        LR = self.reconstruction_loss(mask,dx,dy,p,epoch)
+        LR = self.reconstruction_loss(mask,dx,dy,p)
         loss = LR + LKL
+
         # gradient step
         loss.backward()
         # gradient cliping
@@ -300,16 +335,70 @@ class Model():
         # optim step
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
+
         # some print and save:
         if epoch % 1 == 0:
             #print('epoch',epoch,'loss',loss.data[0],'LR',LR.data[0],'LKL',LKL.data[0])
-            print('epoch %d in %.3f s: loss = %.4f, LR = %.4f, LKL = %.4f' % (epoch,time.time()-t_begin,loss.data[0],LR.data[0],LKL.data[0]))
+            print('epoch %d in %.3f s: loss = %.4f, LR = %.4f, LKL = %.4f' \
+                  % (epoch,time.time()-t_begin,loss.data[0],LR.data[0],LKL.data[0]))
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
-        if epoch % 100 == 0:
-            #self.save(epoch)
-            #self.conditional_generation(epoch)
-            pass
+        if epoch % 1000 == 0:
+            self.test()
+            self.save(epoch)
+            if opt.save_img:
+                self.conditional_generation(dataTrain, epoch)
+
+
+    def test(self):
+        t_begin = time.time()
+
+        self.encoder.eval()
+        self.decoder.eval()
+
+        loss = 0
+        LKL = 0
+        LR = 0
+        nBatches = len(dataTest) / hp.batch_size # NB: assume mod==0
+        for bi in range(0, int(nBatches*hp.batch_size), hp.batch_size):
+            batch, lengths = make_batch(dataTest, hp.batch_size, range(bi, bi+hp.batch_size))
+
+            # encode:
+            z, self.mu, self.sigma = self.encoder(batch, hp.batch_size)
+
+            # create start of sequence:
+            if use_cuda:
+                sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
+                    *hp.batch_size).cuda()).unsqueeze(0)
+            else:
+                sos = Variable(torch.stack([torch.Tensor([0,0,1,0,0])]\
+                    *hp.batch_size)).unsqueeze(0)
+
+            # had sos at the begining of the batch:
+            batch_init = torch.cat([sos, batch],0)
+
+            # expend z to be ready to concatenate with inputs:
+            z_stack = torch.stack([z]*(Nmax+1))
+
+            # inputs is concatenation of z and batch_inputs
+            inputs = torch.cat([batch_init, z_stack],2)
+
+            # decode:
+            self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
+                self.rho_xy, self.q, _, _ = self.decoder(inputs, z)
+
+            # prepare targets:
+            mask,dx,dy,p = self.make_target(batch, lengths)
+
+            # compute losses:
+            LKL += self.kullback_leibler_loss()
+            LR += self.reconstruction_loss(mask,dx,dy,p)
+            loss += LR + LKL
+
+        print('==> TEST in %.3f s: LKL = %.4f, LR = %.4f, loss = %.4f' \
+               % (time.time() - t_begin, LKL / nBatches, LR / nBatches, loss / nBatches))
+        return (LKL / nBatches, LR / nBatches, loss / nBatches)
+
 
     def bivariate_normal_pdf(self, dx, dy):
         z_x = ((dx-self.mu_x)/self.sigma_x)**2
@@ -320,16 +409,14 @@ class Model():
         norm = 2*np.pi*self.sigma_x*self.sigma_y*torch.sqrt(1-self.rho_xy**2)
         return exp/norm
 
-    def reconstruction_loss(self, mask, dx, dy, p, epoch):
+    def reconstruction_loss(self, mask, dx, dy, p):
         pdf = self.bivariate_normal_pdf(dx, dy)
-        LS = -torch.sum(mask*torch.log(1e-5+torch.sum(self.pi * pdf, 2)))\
-            /float(Nmax*hp.batch_size)
-        LP = -torch.sum(p*torch.log(self.q))/float(Nmax*hp.batch_size)
+        LS = -torch.sum(mask*torch.log(1e-5+torch.sum(self.pi * pdf, 2))) / float(Nmax*hp.batch_size)
+        LP = -torch.sum(p*torch.log(self.q)) / float(Nmax*hp.batch_size)
         return LS+LP
 
     def kullback_leibler_loss(self):
-        LKL = -0.5*torch.sum(1+self.sigma-self.mu**2-torch.exp(self.sigma))\
-            /float(hp.Nz*hp.batch_size)
+        LKL = -0.5*torch.sum(1+self.sigma-self.mu**2-torch.exp(self.sigma)) / float(hp.Nz*hp.batch_size)
         if use_cuda:
             KL_min = Variable(torch.Tensor([hp.KL_min]).cuda()).detach()
         else:
@@ -339,9 +426,9 @@ class Model():
     def save(self, epoch):
         sel = np.random.rand()
         torch.save(self.encoder.state_dict(), \
-            'encoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
+            '%s/encoderRNN_sel_%3f_epoch_%d.pth' % (opt.ckpt_dir,sel,epoch))
         torch.save(self.decoder.state_dict(), \
-            'decoderRNN_sel_%3f_epoch_%d.pth' % (sel,epoch))
+            '%s/decoderRNN_sel_%3f_epoch_%d.pth' % (opt.ckpt_dir,sel,epoch))
 
     def load(self, encoder_name, decoder_name):
         saved_encoder = torch.load(encoder_name)
@@ -349,11 +436,13 @@ class Model():
         self.encoder.load_state_dict(saved_encoder)
         self.decoder.load_state_dict(saved_decoder)
 
-    def conditional_generation(self, epoch):
-        batch,lengths = make_batch(1)
+    def conditional_generation(self, data, epoch):
+        batch,lengths = make_batch(data, 1)
+
         # should remove dropouts:
         self.encoder.train(False)
         self.decoder.train(False)
+
         # encode:
         z, _, _ = self.encoder(batch, 1)
         if use_cuda:
@@ -361,26 +450,30 @@ class Model():
         else:
             sos = Variable(torch.Tensor([0,0,1,0,0]).view(1,1,-1))
         s = sos
+
         seq_x = []
         seq_y = []
         seq_z = []
         hidden_cell = None
         for i in range(Nmax):
             input = torch.cat([s,z.unsqueeze(0)],2)
+
             # decode:
             self.pi, self.mu_x, self.mu_y, self.sigma_x, self.sigma_y, \
-                self.rho_xy, self.q, hidden, cell = \
-                    self.decoder(input, z, hidden_cell)
+                self.rho_xy, self.q, hidden, cell = self.decoder(input, z, hidden_cell)
             hidden_cell = (hidden, cell)
+
             # sample from parameters:
             s, dx, dy, pen_down, eos = self.sample_next_state()
+
             #------
             seq_x.append(dx)
             seq_y.append(dy)
             seq_z.append(pen_down)
             if eos:
-                print(i)
+                print('==> conditional_generation: epoch %d, Nmax=%d' % (epoch,i))
                 break
+
         # visualize result:
         x_sample = np.cumsum(seq_x, 0)
         y_sample = np.cumsum(seq_y, 0)
@@ -444,7 +537,7 @@ def make_image(sequence, epoch, name='_output_'):
     canvas.draw()
     pil_image = PIL.Image.frombytes('RGB', canvas.get_width_height(),
                  canvas.tostring_rgb())
-    name = str(epoch)+name+'.jpg'
+    name = opt.ckpt_dir + '/' + str(epoch)+name+'.jpg'
     pil_image.save(name,"JPEG")
     plt.close("all")
 
