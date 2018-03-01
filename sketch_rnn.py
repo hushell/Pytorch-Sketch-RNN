@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import PIL
+import os
+import time
 
 import torch
 import torch.nn as nn
@@ -8,7 +10,10 @@ from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
 
+import my_lstm
+
 use_cuda = torch.cuda.is_available()
+#os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 ###################################### hyperparameters
 class HParams():
@@ -40,7 +45,7 @@ def max_size(data):
     return max(sizes)
 
 def purify(strokes):
-    """removes to small or too long sequences + removes large gaps"""
+    """removes too small or too long sequences + removes large gaps"""
     data = []
     for seq in strokes:
         if len(seq[:,0]) <= hp.max_seq_length and len(seq[:,0])>10:
@@ -112,12 +117,15 @@ def lr_decay(optimizer):
 class EncoderRNN(nn.Module):
     def __init__(self):
         super(EncoderRNN, self).__init__()
+
         # bidirectional lstm:
-        self.lstm = nn.LSTM(5, hp.enc_hidden_size, \
-            dropout=hp.dropout, bidirectional=True)
+        #self.lstm = nn.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
+        self.lstm = my_lstm.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
+
         # create mu and sigma from lstm's last output:
         self.fc_mu = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
         self.fc_sigma = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
+
         # active dropout:
         self.train()
 
@@ -152,10 +160,14 @@ class EncoderRNN(nn.Module):
 class DecoderRNN(nn.Module):
     def __init__(self):
         super(DecoderRNN, self).__init__()
+
         # to init hidden and cell from z:
         self.fc_hc = nn.Linear(hp.Nz, 2*hp.dec_hidden_size)
+
         # unidirectional lstm:
-        self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        #self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        self.lstm = my_lstm.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+
         # create proba distribution parameters from hiddens:
         self.fc_params = nn.Linear(hp.dec_hidden_size,6*hp.M+3)
 
@@ -164,6 +176,7 @@ class DecoderRNN(nn.Module):
             # then we must init from z
             hidden,cell = torch.split(F.tanh(self.fc_hc(z)),hp.dec_hidden_size,1)
             hidden_cell = (hidden.unsqueeze(0).contiguous(), cell.unsqueeze(0).contiguous())
+
         outputs,(hidden,cell) = self.lstm(inputs, hidden_cell)
         # in training we feed the lstm with the whole input in one shot
         # and use all outputs contained in 'outputs', while in generate
@@ -172,12 +185,15 @@ class DecoderRNN(nn.Module):
             y = self.fc_params(outputs.view(-1, hp.dec_hidden_size))
         else:
             y = self.fc_params(hidden.view(-1, hp.dec_hidden_size))
+
         # separate pen and mixture params:
         params = torch.split(y,6,1)
         params_mixture = torch.stack(params[:-1]) # trajectory
         params_pen = params[-1] # pen up/down
+
         # identify mixture params:
         pi,mu_x,mu_y,sigma_x,sigma_y,rho_xy = torch.split(params_mixture,1,2)
+
         # preprocess params::
         if self.training:
             len_out = Nmax+1
@@ -228,6 +244,8 @@ class Model():
         return mask,dx,dy,p
 
     def train(self, epoch):
+        t_begin = time.time()
+
         self.encoder.train()
         self.decoder.train()
         batch, lengths = make_batch(hp.batch_size)
@@ -269,13 +287,15 @@ class Model():
         self.encoder_optimizer.step()
         self.decoder_optimizer.step()
         # some print and save:
-        if epoch%1==0:
-            print('epoch',epoch,'loss',loss.data[0],'LR',LR.data[0],'LKL',LKL.data[0])
+        if epoch % 1 == 0:
+            #print('epoch',epoch,'loss',loss.data[0],'LR',LR.data[0],'LKL',LKL.data[0])
+            print('epoch %d in %.3f s: loss = %.4f, LR = %.4f, LKL = %.4f' % (epoch,time.time()-t_begin,loss.data[0],LR.data[0],LKL.data[0]))
             self.encoder_optimizer = lr_decay(self.encoder_optimizer)
             self.decoder_optimizer = lr_decay(self.decoder_optimizer)
-        if epoch%100==0:
+        if epoch % 100 == 0:
             #self.save(epoch)
-            self.conditional_generation(epoch)
+            #self.conditional_generation(epoch)
+            pass
 
     def bivariate_normal_pdf(self, dx, dy):
         z_x = ((dx-self.mu_x)/self.sigma_x)**2
