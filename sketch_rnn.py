@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import PIL
 import os
 import time
+import argparse
 
 import torch
 import torch.nn as nn
@@ -12,8 +13,16 @@ import torch.nn.functional as F
 
 import symm_lstm
 
+cudnn.benchmark = True
 use_cuda = torch.cuda.is_available()
-#os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+parser = argparse.ArgumentParser(description='sketch RNN')
+parser.add_argument('--gpu_id', default='0', type=str,
+                    help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--symm', action='store_true')
+opt = parser.parse_args()
+
+os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_id
 
 ###################################### hyperparameters
 class HParams():
@@ -81,8 +90,9 @@ data = normalize(data)
 Nmax = max_size(data)
 
 ############################## function to generate a batch:
-def make_batch(batch_size):
-    batch_idx = np.random.choice(len(data),batch_size)
+def make_batch(batch_size, batch_idx=None):
+    if batch_idx is None:
+        batch_idx = np.random.choice(len(data),batch_size)
     batch_sequences = [data[idx] for idx in batch_idx]
     strokes = []
     lengths = []
@@ -119,8 +129,10 @@ class EncoderRNN(nn.Module):
         super(EncoderRNN, self).__init__()
 
         # bidirectional lstm:
-        #self.lstm = nn.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
-        self.lstm = symm_lstm.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
+        if opt.symm:
+            self.lstm = symm_lstm.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
+        else:
+            self.lstm = nn.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
 
         # create mu and sigma from lstm's last output:
         self.fc_mu = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
@@ -165,8 +177,10 @@ class DecoderRNN(nn.Module):
         self.fc_hc = nn.Linear(hp.Nz, 2*hp.dec_hidden_size)
 
         # unidirectional lstm:
-        #self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
-        self.lstm = symm_lstm.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        if opt.symm:
+            self.lstm = symm_lstm.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        else:
+            self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
 
         # create proba distribution parameters from hiddens:
         self.fc_params = nn.Linear(hp.dec_hidden_size,6*hp.M+3)
