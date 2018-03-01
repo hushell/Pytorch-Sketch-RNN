@@ -10,7 +10,7 @@ from torch.autograd import Variable
 from torch import optim
 import torch.nn.functional as F
 
-import my_lstm
+import symm_lstm
 
 use_cuda = torch.cuda.is_available()
 #os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -120,7 +120,7 @@ class EncoderRNN(nn.Module):
 
         # bidirectional lstm:
         #self.lstm = nn.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
-        self.lstm = my_lstm.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
+        self.lstm = symm_lstm.LSTM(5, hp.enc_hidden_size, dropout=hp.dropout, bidirectional=True)
 
         # create mu and sigma from lstm's last output:
         self.fc_mu = nn.Linear(2*hp.enc_hidden_size, hp.Nz)
@@ -166,7 +166,7 @@ class DecoderRNN(nn.Module):
 
         # unidirectional lstm:
         #self.lstm = nn.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
-        self.lstm = my_lstm.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
+        self.lstm = symm_lstm.LSTM(hp.Nz+5, hp.dec_hidden_size, dropout=hp.dropout)
 
         # create proba distribution parameters from hiddens:
         self.fc_params = nn.Linear(hp.dec_hidden_size,6*hp.M+3)
