@@ -14,7 +14,8 @@ import torch.backends.cudnn as cudnn
 
 import symm_lstm
 
-cudnn.benchmark = True
+#cudnn.benchmark = True
+cudnn.enabled = True
 use_cuda = torch.cuda.is_available()
 
 parser = argparse.ArgumentParser(description='sketch RNN')
@@ -323,9 +324,9 @@ class Model():
         self.eta_step = 1-(1-hp.eta_min)*hp.R
 
         # compute losses:
-        LKL = self.kullback_leibler_loss()
+        LKL, KL_min = self.kullback_leibler_loss()
         LR = self.reconstruction_loss(mask,dx,dy,p)
-        loss = LR + LKL
+        loss = LR + hp.wKL*self.eta_step * torch.max(LKL,KL_min)
 
         # gradient step
         loss.backward()
@@ -356,9 +357,9 @@ class Model():
         self.encoder.eval()
         self.decoder.eval()
 
-        loss = 0
-        LKL = 0
-        LR = 0
+        loss = []
+        LKL = []
+        LR = []
         nBatches = len(dataTest) / hp.batch_size # NB: assume mod==0
         for bi in range(0, int(nBatches*hp.batch_size), hp.batch_size):
             batch, lengths = make_batch(dataTest, hp.batch_size, range(bi, bi+hp.batch_size))
@@ -391,13 +392,15 @@ class Model():
             mask,dx,dy,p = self.make_target(batch, lengths)
 
             # compute losses:
-            LKL += self.kullback_leibler_loss()
-            LR += self.reconstruction_loss(mask,dx,dy,p)
-            loss += LR + LKL
+            LKL1, _ = self.kullback_leibler_loss()
+            LR1 = self.reconstruction_loss(mask,dx,dy,p)
+            loss.append(LR1 + hp.wKL * LKL1)
+            LKL.append(LKL1)
+            LR.append(LR1)
 
-        print('==> TEST in %.3f s: LKL = %.4f, LR = %.4f, loss = %.4f' \
-               % (time.time() - t_begin, LKL / nBatches, LR / nBatches, loss / nBatches))
-        return (LKL / nBatches, LR / nBatches, loss / nBatches)
+        print('\n\n==> TEST on %d batches in %.3fs: loss = %.4f, LKL = %.4f, LR = %.4f\n\n' \
+               % (nBatches, time.time()-t_begin, np.mean(loss), np.mean(LKL), np.mean(LR)))
+        return (np.mean(loss), np.mean(LKL), np.mean(LR))
 
 
     def bivariate_normal_pdf(self, dx, dy):
@@ -421,7 +424,7 @@ class Model():
             KL_min = Variable(torch.Tensor([hp.KL_min]).cuda()).detach()
         else:
             KL_min = Variable(torch.Tensor([hp.KL_min])).detach()
-        return hp.wKL*self.eta_step * torch.max(LKL,KL_min)
+        return (LKL,KL_min)
 
     def save(self, epoch):
         sel = np.random.rand()
