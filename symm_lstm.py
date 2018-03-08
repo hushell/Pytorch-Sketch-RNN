@@ -10,8 +10,16 @@ from torch.nn.utils.rnn import PackedSequence
 import torch.nn.functional as F
 from torch.nn._functions.rnn import fusedBackend
 
+def symm_func(w):
+    assert(w.size(0) == w.size(1) and len(w.size()) == 2)
+    return (w + w.t()).div(2)
 
 def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
+    # w_hh
+    wh_blocks = w_hh.chunk(4, dim=0) # (W_hi|W_hf|W_hg|W_ho)
+    w_hh_symm = [symm_func(wh) for wh in wh_blocks]
+    w_hh = torch.cat(w_hh_symm, dim=0)
+
     if input.is_cuda:
         igates = F.linear(input, w_ih)
         hgates = F.linear(hidden[0], w_hh)
